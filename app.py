@@ -1,9 +1,11 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Body
 import pandas as pd
 import io
 import re
 import pdfplumber
 from datetime import datetime, timedelta
+import os
+import json
 
 app = FastAPI()
 
@@ -11,6 +13,7 @@ NOISE = {
     "pos", "visa", "debit", "credit", "purchase",
     "canada", "ca", "inc", "ltd", "store", "payment", "preauth"
 }
+
 
 def canonicalize_merchant(s: str) -> str:
     s = (s or "").lower().strip()
@@ -33,6 +36,7 @@ def canonicalize_merchant(s: str) -> str:
 
     return s
 
+
 def clean_merchant(s: str) -> str:
     s = (s or "").lower()
     s = re.sub(r"\d+", " ", s)
@@ -40,6 +44,7 @@ def clean_merchant(s: str) -> str:
     parts = [p for p in s.split() if p not in NOISE]
     s = " ".join(parts).strip()
     return canonicalize_merchant(s)
+
 
 def try_parse_date(val: str):
     if not val:
@@ -52,9 +57,10 @@ def try_parse_date(val: str):
     for fmt in formats:
         try:
             return datetime.strptime(val, fmt)
-        except:
+        except Exception:
             pass
     return None
+
 
 def extract_text_from_pdf(raw_bytes: bytes) -> str:
     text_parts = []
@@ -64,6 +70,7 @@ def extract_text_from_pdf(raw_bytes: bytes) -> str:
             if txt:
                 text_parts.append(txt)
     return "\n".join(text_parts)
+
 
 def parse_pdf_transactions_from_text(text: str) -> pd.DataFrame:
     rows = []
@@ -107,6 +114,7 @@ def parse_pdf_transactions_from_text(text: str) -> pd.DataFrame:
 
     return pd.DataFrame(rows)
 
+
 def detect_frequency(day_diffs):
     if len(day_diffs) < 2:
         return None
@@ -120,6 +128,7 @@ def detect_frequency(day_diffs):
         return "yearly"
     return None
 
+
 def score_confidence(n, amount_cv, cadence_ok):
     score = 0.0
     score += min(n / 6, 1.0) * 0.4
@@ -127,12 +136,13 @@ def score_confidence(n, amount_cv, cadence_ok):
     score += 0.2 if cadence_ok else 0.0
     return round(min(score, 1.0), 2)
 
+
 def run_detection(df: pd.DataFrame):
     subscriptions = []
     needs_review = []
 
     if df.empty:
-        return subscriptions, needs_review
+        return subscriptions, needs_review, df
 
     df = df.copy()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
@@ -190,9 +200,27 @@ def run_detection(df: pd.DataFrame):
     df["date"] = df["date"].astype(str)
     return subscriptions, needs_review, df
 
+
+def simple_category_rule(name: str) -> str:
+    s = (name or "").lower()
+
+    if "netflix" in s or "spotify" in s or "prime" in s:
+        return "Streaming"
+    if "google" in s and "storage" in s:
+        return "Cloud Storage"
+    if "rogers" in s:
+        return "Telecom"
+    if "hydro" in s:
+        return "Utilities"
+    if "uber" in s:
+        return "Transport"
+    return "Other"
+
+
 @app.get("/")
 def health():
     return {"ok": True}
+
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
@@ -205,7 +233,13 @@ async def analyze(file: UploadFile = File(...)):
         text = extract_text_from_pdf(raw)
         df = parse_pdf_transactions_from_text(text)
     else:
-        return {"error": "Unsupported file type", "subscriptions": [], "needs_review": [], "parsed_rows": [], "row_count": 0}
+        return {
+            "error": "Unsupported file type",
+            "subscriptions": [],
+            "needs_review": [],
+            "parsed_rows": [],
+            "row_count": 0
+        }
 
     subscriptions, needs_review, parsed_df = run_detection(df)
 
@@ -216,3 +250,186 @@ async def analyze(file: UploadFile = File(...)):
         "row_count": len(parsed_df),
         "error": ""
     }
+
+
+@app.post("/recalculate")
+async def recalculate(payload: dict = Body(...)):
+    parsed_rows = payload.get("parsed_rows", [])
+
+    if not parsed_rows:
+        return {
+            "error": "No parsed rows provided.",
+            "subscriptions": [],
+            "needs_review": [],
+            "parsed_rows": [],
+            "row_count": 0
+        }
+
+    try:
+        df = pd.DataFrame(parsed_rows)
+
+        required = ["date", "merchant", "amount", "merchant_normalized"]
+        missing = [col for col in required if col not in df.columns]
+        if missing:
+            return {
+                "error": f"Missing required columns: {', '.join(missing)}",
+                "subscriptions": [],
+                "needs_review": [],
+                "parsed_rows": parsed_rows,
+                "row_count": len(parsed_rows)
+            }
+
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df["merchant"] = df["merchant"].astype(str)
+        df["merchant_normalized"] = df["merchant_normalized"].astype(str)
+        df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+        if "currency" in df.columns:
+            df["currency"] = df["currency"].astype(str)
+
+        df = df.dropna(subset=["date", "merchant", "amount", "merchant_normalized"])
+
+        subscriptions = []
+        needs_review = []
+
+        for merchant, g in df.groupby("merchant_normalized"):
+            g = g.sort_values("date")
+
+            if len(g) < 3:
+                continue
+
+            amounts = g["amount"].astype(float).tolist()
+            avg_amount = sum(amounts) / len(amounts)
+
+            mean = avg_amount
+            var = sum((x - mean) ** 2 for x in amounts) / max(len(amounts) - 1, 1)
+            std = var ** 0.5
+            amount_cv = (std / mean) if mean != 0 else 1.0
+
+            dates = g["date"].dt.date.tolist()
+            day_diffs = [(dates[i] - dates[i - 1]).days for i in range(1, len(dates))]
+            freq = detect_frequency(day_diffs)
+            cadence_ok = freq is not None
+            conf = score_confidence(len(g), amount_cv, cadence_ok)
+
+            last_paid = dates[-1]
+            if freq == "weekly":
+                next_expected = last_paid + timedelta(days=7)
+            elif freq == "monthly":
+                next_expected = last_paid + timedelta(days=30)
+            elif freq == "yearly":
+                next_expected = last_paid + timedelta(days=365)
+            else:
+                next_expected = None
+
+            item = {
+                "merchant": g["merchant"].iloc[-1],
+                "merchant_normalized": merchant,
+                "frequency": freq or "unknown",
+                "avg_amount": round(avg_amount, 2),
+                "last_paid": str(last_paid),
+                "next_expected": str(next_expected) if next_expected else None,
+                "confidence": conf,
+                "evidence": f"{len(g)} charges; avg cadence ≈ {round(sum(day_diffs)/len(day_diffs), 1)} days; amount variation ~ {round(amount_cv * 100, 1)}%"
+            }
+
+            if conf >= 0.7 and freq != "unknown":
+                subscriptions.append(item)
+            else:
+                needs_review.append(item)
+
+        parsed_rows_out = df.copy()
+        parsed_rows_out["date"] = parsed_rows_out["date"].astype(str)
+
+        return {
+            "subscriptions": subscriptions,
+            "needs_review": needs_review,
+            "parsed_rows": parsed_rows_out.to_dict(orient="records"),
+            "row_count": len(parsed_rows_out),
+            "error": ""
+        }
+
+    except Exception as e:
+        return {
+            "error": f"Failed to recalculate: {str(e)}",
+            "subscriptions": [],
+            "needs_review": [],
+            "parsed_rows": parsed_rows,
+            "row_count": len(parsed_rows)
+        }
+
+
+@app.post("/enrich")
+async def enrich(payload: dict = Body(...)):
+    subscriptions = payload.get("subscriptions", [])
+
+    if not subscriptions:
+        return {"subscriptions": [], "error": ""}
+
+    api_key = os.getenv("OPENAI_API_KEY")
+
+    # fallback without LLM
+    if not api_key:
+        enriched = []
+        for sub in subscriptions:
+            item = dict(sub)
+            item["category"] = simple_category_rule(sub.get("merchant_normalized", ""))
+            item["description"] = f"Likely recurring {item['category'].lower()} charge."
+            enriched.append(item)
+
+        return {"subscriptions": enriched, "error": ""}
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+
+        enriched = []
+
+        for sub in subscriptions:
+            merchant_name = sub.get("merchant_normalized") or sub.get("merchant") or ""
+
+            prompt = f"""
+You are classifying a subscription merchant.
+Merchant: {merchant_name}
+
+Return strict JSON with exactly these keys:
+category
+description
+
+Rules:
+- category should be short, like Streaming, Utilities, Telecom, Cloud Storage, Transport, Other
+- description should be one short sentence
+"""
+
+            response = client.responses.create(
+                model="gpt-5-mini",
+                input=prompt
+            )
+
+            text = response.output_text.strip()
+
+            category = simple_category_rule(merchant_name)
+            description = f"Likely recurring {category.lower()} charge."
+
+            try:
+                parsed = json.loads(text)
+                category = parsed.get("category", category)
+                description = parsed.get("description", description)
+            except Exception:
+                pass
+
+            item = dict(sub)
+            item["category"] = category
+            item["description"] = description
+            enriched.append(item)
+
+        return {"subscriptions": enriched, "error": ""}
+
+    except Exception as e:
+        enriched = []
+        for sub in subscriptions:
+            item = dict(sub)
+            item["category"] = simple_category_rule(sub.get("merchant_normalized", ""))
+            item["description"] = f"Likely recurring {item['category'].lower()} charge."
+            enriched.append(item)
+
+        return {"subscriptions": enriched, "error": f"LLM enrichment failed, fallback rules used: {str(e)}"}

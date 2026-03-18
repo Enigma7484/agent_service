@@ -5,3 +5,4 @@ python-dateutil
 rapidfuzz
 pdfplumber
 pypdf
+openai
