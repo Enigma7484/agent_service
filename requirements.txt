@@ -1,0 +1,9 @@
+fastapi
+langgraph
+typing
+pandas
+os
+io
+re
+pdfplumber
+datetime
