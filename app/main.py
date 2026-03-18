@@ -508,6 +508,11 @@ def simple_category_rule(name: str) -> str:
 # ----------------------------
 # FastAPI endpoint
 # ----------------------------
+
+@app.get("/")
+def health():
+    return {"ok": True}
+
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
     raw = await file.read()
