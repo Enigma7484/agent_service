@@ -1,1 +1,7 @@
 fastapi
+python-multipart
+pandas
+python-dateutil
+rapidfuzz
+pdfplumber
+pypdf
