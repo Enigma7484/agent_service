@@ -4,6 +4,7 @@ import io
 import re
 import pdfplumber
 from datetime import datetime, timedelta
+from functools import lru_cache
 import os
 import json
 
@@ -216,6 +217,29 @@ def simple_category_rule(name: str) -> str:
         return "Transport"
     return "Other"
 
+class AgentState(dict):
+    pass
+
+@lru_cache(maxsize=1)
+def get_compiled_graph():
+    from langgraph.graph import StateGraph, END
+
+    def parse_csv(state):
+        df = pd.read_csv(io.BytesIO(state["raw_bytes"]))
+        state["df"] = df
+        return state
+
+    def finalize(state):
+        return state
+
+    graph = StateGraph(dict)
+    graph.add_node("parse_csv", parse_csv)
+    graph.add_node("finalize", finalize)
+    graph.set_entry_point("parse_csv")
+    graph.add_edge("parse_csv", "finalize")
+    graph.add_edge("finalize", END)
+
+    return graph.compile()
 
 @app.get("/")
 def health():
