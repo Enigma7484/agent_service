@@ -1,9 +1,9 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
-    "api/*.py": {
+    "api/**/*.py": {
       "maxDuration": 60,
-      "excludeFiles": "{__pycache__/**,.venv/**,tests/**,__tests__/**,**/*.test.py,**/test_*.py,fixtures/**,__fixtures__/**,testdata/**,sample-data/**,static/**,assets/**,docker-compose.yml}"
+      "excludeFiles": "{__pycache__/**,.venv/**,tests/**,__tests__/**,**/*.test.py,**/test_*.py,fixtures/**,__fixtures__/**,testdata/**,sample-data/**,static/**,assets/**,docker-compose.yml,sample_transactions.csv,sample_transactions.pdf}"
     }
   },
   "rewrites": [
