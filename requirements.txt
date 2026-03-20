@@ -6,3 +6,4 @@ rapidfuzz
 pdfplumber
 pypdf
 openai
+langgraph
