@@ -1,12 +1,13 @@
 from fastapi import FastAPI, UploadFile, File, Body
+from functools import lru_cache
 import pandas as pd
 import io
 import re
 import pdfplumber
 from datetime import datetime, timedelta
-from functools import lru_cache
 import os
 import json
+from typing import TypedDict, List, Dict, Any
 
 app = FastAPI()
 
@@ -14,6 +15,18 @@ NOISE = {
     "pos", "visa", "debit", "credit", "purchase",
     "canada", "ca", "inc", "ltd", "store", "payment", "preauth"
 }
+
+
+class AgentState(TypedDict):
+    filename: str
+    raw_bytes: bytes
+    file_type: str
+    df: Any
+    extracted_text: str
+    pdf_tables: Any
+    subscriptions: List[Dict[str, Any]]
+    needs_review: List[Dict[str, Any]]
+    error: str
 
 
 def canonicalize_merchant(s: str) -> str:
@@ -73,45 +86,121 @@ def extract_text_from_pdf(raw_bytes: bytes) -> str:
     return "\n".join(text_parts)
 
 
+def extract_tables_from_pdf(raw_bytes: bytes) -> list:
+    all_tables = []
+    with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
+        for page in pdf.pages:
+            tables = page.extract_tables()
+            if tables:
+                all_tables.extend(tables)
+    return all_tables
+
+
+def looks_like_amount(val: str):
+    if val is None:
+        return False
+    val = str(val).strip().replace(",", "")
+    return bool(re.fullmatch(r"-?\d+\.\d{2}", val))
+
+
+def parse_pdf_transactions_from_tables(tables: list) -> pd.DataFrame:
+    rows = []
+
+    for table in tables:
+        if not table:
+            continue
+
+        for row in table:
+            if not row or len(row) < 3:
+                continue
+
+            cleaned = [str(cell).strip() if cell is not None else "" for cell in row]
+
+            date_idx = None
+            amount_idx = None
+
+            for i, cell in enumerate(cleaned):
+                if date_idx is None and try_parse_date(cell):
+                    date_idx = i
+                if amount_idx is None and looks_like_amount(cell):
+                    amount_idx = i
+
+            if date_idx is None or amount_idx is None or date_idx == amount_idx:
+                continue
+
+            parsed_date = try_parse_date(cleaned[date_idx])
+            amount = float(cleaned[amount_idx].replace(",", ""))
+
+            merchant_parts = []
+            for i, cell in enumerate(cleaned):
+                if i not in [date_idx, amount_idx] and cell:
+                    merchant_parts.append(cell)
+
+            merchant = " ".join(merchant_parts).strip()
+
+            if parsed_date and merchant:
+                rows.append({
+                    "date": parsed_date.strftime("%Y-%m-%d"),
+                    "merchant": merchant,
+                    "amount": amount
+                })
+
+    return pd.DataFrame(rows)
+
+
 def parse_pdf_transactions_from_text(text: str) -> pd.DataFrame:
     rows = []
     lines = text.splitlines()
 
-    pattern = re.compile(
-        r"^\s*"
-        r"(?P<date>\d{4}[-/]\d{2}[-/]\d{2}|\d{2}[-/]\d{2}[-/]\d{4})"
-        r"\s+"
-        r"(?P<merchant>.+?)"
-        r"\s+"
-        r"(?P<amount>-?\d+\.\d{2})"
-        r"(?:\s+(?P<currency>[A-Z]{3}))?"
-        r"\s*$"
-    )
+    patterns = [
+        re.compile(
+            r"^\s*"
+            r"(?P<date>\d{4}[-/]\d{2}[-/]\d{2}|\d{2}[-/]\d{2}[-/]\d{4})"
+            r"\s+"
+            r"(?P<merchant>.+?)"
+            r"\s+"
+            r"(?P<amount>-?\d+\.\d{2})"
+            r"(?:\s+(?P<currency>[A-Z]{3}))?"
+            r"\s*$"
+        ),
+        re.compile(
+            r"^\s*"
+            r"(?P<merchant>.+?)"
+            r"\s+"
+            r"(?P<date>\d{4}[-/]\d{2}[-/]\d{2}|\d{2}[-/]\d{2}[-/]\d{4})"
+            r"\s+"
+            r"(?P<amount>-?\d+\.\d{2})"
+            r"(?:\s+(?P<currency>[A-Z]{3}))?"
+            r"\s*$"
+        ),
+    ]
 
     for line in lines:
         line = line.strip()
         if not line:
             continue
 
-        m = pattern.match(line)
-        if not m:
-            continue
+        for pattern in patterns:
+            m = pattern.match(line)
+            if not m:
+                continue
 
-        parsed_date = try_parse_date(m.group("date"))
-        if not parsed_date:
-            continue
+            parsed_date = try_parse_date(m.group("date"))
+            if not parsed_date:
+                continue
 
-        row = {
-            "date": parsed_date.strftime("%Y-%m-%d"),
-            "merchant": m.group("merchant").strip(),
-            "amount": float(m.group("amount"))
-        }
+            row = {
+                "date": parsed_date.strftime("%Y-%m-%d"),
+                "merchant": m.group("merchant").strip(),
+                "amount": float(m.group("amount"))
+            }
 
-        currency = m.groupdict().get("currency")
-        if currency:
-            row["currency"] = currency
+            currency = m.groupdict().get("currency")
+            if currency:
+                row["currency"] = currency
 
-        rows.append(row)
+            rows.append(row)
+            break
 
     return pd.DataFrame(rows)
 
@@ -138,19 +227,136 @@ def score_confidence(n, amount_cv, cadence_ok):
     return round(min(score, 1.0), 2)
 
 
-def run_detection(df: pd.DataFrame):
-    subscriptions = []
-    needs_review = []
+def simple_category_rule(name: str) -> str:
+    s = (name or "").lower()
 
-    if df.empty:
-        return subscriptions, needs_review, df
+    if "netflix" in s or "spotify" in s or "prime" in s:
+        return "Streaming"
+    if "google" in s and "storage" in s:
+        return "Cloud Storage"
+    if "rogers" in s:
+        return "Telecom"
+    if "hydro" in s:
+        return "Utilities"
+    if "uber" in s:
+        return "Transport"
+    return "Other"
 
-    df = df.copy()
+
+# ----------------------------
+# LangGraph nodes
+# ----------------------------
+def detect_file_type(state: AgentState) -> AgentState:
+    filename = state["filename"].lower()
+
+    if filename.endswith(".csv"):
+        state["file_type"] = "csv"
+    elif filename.endswith(".pdf"):
+        state["file_type"] = "pdf"
+    else:
+        state["error"] = "Unsupported file type. Please upload a CSV or PDF file."
+
+    return state
+
+
+def parse_csv(state: AgentState) -> AgentState:
+    if state["error"]:
+        return state
+
+    try:
+        state["df"] = pd.read_csv(io.BytesIO(state["raw_bytes"]))
+    except Exception as e:
+        state["error"] = f"Failed to parse CSV: {str(e)}"
+
+    return state
+
+
+def extract_pdf(state: AgentState) -> AgentState:
+    if state["error"]:
+        return state
+
+    try:
+        text = extract_text_from_pdf(state["raw_bytes"])
+        tables = extract_tables_from_pdf(state["raw_bytes"])
+        state["extracted_text"] = text
+        state["pdf_tables"] = tables
+
+        if not text.strip() and not tables:
+            state["error"] = "No extractable text or tables found in PDF. It may be scanned/image-based."
+    except Exception as e:
+        state["error"] = f"Failed to read PDF: {str(e)}"
+
+    return state
+
+
+def parse_pdf(state: AgentState) -> AgentState:
+    if state["error"]:
+        return state
+
+    try:
+        df_tables = parse_pdf_transactions_from_tables(state.get("pdf_tables", []))
+        df_text = parse_pdf_transactions_from_text(state["extracted_text"])
+
+        if not df_tables.empty:
+            df = df_tables
+        elif not df_text.empty:
+            df = df_text
+        else:
+            state["error"] = (
+                "PDF was read, but no transaction rows could be parsed. "
+                "The statement likely needs a custom parser or OCR."
+            )
+            return state
+
+        state["df"] = df.drop_duplicates().reset_index(drop=True)
+    except Exception as e:
+        state["error"] = f"Failed to parse PDF transactions: {str(e)}"
+
+    return state
+
+
+def standardize_schema(state: AgentState) -> AgentState:
+    if state["error"]:
+        return state
+
+    df = state["df"].copy()
+
+    if "currency" in df.columns:
+        df["currency"] = df["currency"].astype(str)
+
+    required = ["date", "merchant", "amount"]
+    missing = [col for col in required if col not in df.columns]
+
+    if missing:
+        state["error"] = f"Missing required columns: {', '.join(missing)}"
+        return state
+
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["merchant"] = df["merchant"].astype(str)
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+
     df = df.dropna(subset=["date", "merchant", "amount"])
+    state["df"] = df
+    return state
+
+
+def normalize_merchants(state: AgentState) -> AgentState:
+    if state["error"]:
+        return state
+
+    df = state["df"].copy()
     df["merchant_normalized"] = df["merchant"].apply(clean_merchant)
+    state["df"] = df
+    return state
+
+
+def detect_recurring(state: AgentState) -> AgentState:
+    if state["error"]:
+        return state
+
+    df = state["df"].copy()
+    subscriptions = []
+    needs_review = []
 
     for merchant, g in df.groupby("merchant_normalized"):
         g = g.sort_values("date")
@@ -198,48 +404,98 @@ def run_detection(df: pd.DataFrame):
         else:
             needs_review.append(item)
 
-    df["date"] = df["date"].astype(str)
-    return subscriptions, needs_review, df
+    state["subscriptions"] = subscriptions
+    state["needs_review"] = needs_review
+    return state
 
 
-def simple_category_rule(name: str) -> str:
-    s = (name or "").lower()
+def finalize(state: AgentState) -> AgentState:
+    return state
 
-    if "netflix" in s or "spotify" in s or "prime" in s:
-        return "Streaming"
-    if "google" in s and "storage" in s:
-        return "Cloud Storage"
-    if "rogers" in s:
-        return "Telecom"
-    if "hydro" in s:
-        return "Utilities"
-    if "uber" in s:
-        return "Transport"
-    return "Other"
 
-class AgentState(dict):
-    pass
+def route_after_type(state: AgentState):
+    if state["error"]:
+        return "finalize"
+    if state["file_type"] == "csv":
+        return "parse_csv"
+    if state["file_type"] == "pdf":
+        return "extract_pdf"
+    return "finalize"
+
+
+def route_after_csv(state: AgentState):
+    if state["error"]:
+        return "finalize"
+    return "standardize_schema"
+
+
+def route_after_extract_pdf(state: AgentState):
+    if state["error"]:
+        return "finalize"
+    return "parse_pdf"
+
+
+def route_after_parse_pdf(state: AgentState):
+    if state["error"]:
+        return "finalize"
+    return "standardize_schema"
+
+
+def route_after_standardize(state: AgentState):
+    if state["error"]:
+        return "finalize"
+    return "normalize_merchants"
+
 
 @lru_cache(maxsize=1)
 def get_compiled_graph():
     from langgraph.graph import StateGraph, END
 
-    def parse_csv(state):
-        df = pd.read_csv(io.BytesIO(state["raw_bytes"]))
-        state["df"] = df
-        return state
+    graph = StateGraph(AgentState)
 
-    def finalize(state):
-        return state
-
-    graph = StateGraph(dict)
+    graph.add_node("detect_file_type", detect_file_type)
     graph.add_node("parse_csv", parse_csv)
+    graph.add_node("extract_pdf", extract_pdf)
+    graph.add_node("parse_pdf", parse_pdf)
+    graph.add_node("standardize_schema", standardize_schema)
+    graph.add_node("normalize_merchants", normalize_merchants)
+    graph.add_node("detect_recurring", detect_recurring)
     graph.add_node("finalize", finalize)
-    graph.set_entry_point("parse_csv")
-    graph.add_edge("parse_csv", "finalize")
+
+    graph.set_entry_point("detect_file_type")
+
+    graph.add_conditional_edges("detect_file_type", route_after_type, {
+        "parse_csv": "parse_csv",
+        "extract_pdf": "extract_pdf",
+        "finalize": "finalize"
+    })
+
+    graph.add_conditional_edges("parse_csv", route_after_csv, {
+        "standardize_schema": "standardize_schema",
+        "finalize": "finalize"
+    })
+
+    graph.add_conditional_edges("extract_pdf", route_after_extract_pdf, {
+        "parse_pdf": "parse_pdf",
+        "finalize": "finalize"
+    })
+
+    graph.add_conditional_edges("parse_pdf", route_after_parse_pdf, {
+        "standardize_schema": "standardize_schema",
+        "finalize": "finalize"
+    })
+
+    graph.add_conditional_edges("standardize_schema", route_after_standardize, {
+        "normalize_merchants": "normalize_merchants",
+        "finalize": "finalize"
+    })
+
+    graph.add_edge("normalize_merchants", "detect_recurring")
+    graph.add_edge("detect_recurring", "finalize")
     graph.add_edge("finalize", END)
 
     return graph.compile()
+
 
 @app.get("/")
 def health():
@@ -249,30 +505,34 @@ def health():
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
     raw = await file.read()
-    filename = (file.filename or "").lower()
 
-    if filename.endswith(".csv"):
-        df = pd.read_csv(io.BytesIO(raw))
-    elif filename.endswith(".pdf"):
-        text = extract_text_from_pdf(raw)
-        df = parse_pdf_transactions_from_text(text)
-    else:
+    initial_state: AgentState = {
+        "filename": file.filename or "",
+        "raw_bytes": raw,
+        "file_type": "",
+        "df": None,
+        "extracted_text": "",
+        "pdf_tables": [],
+        "subscriptions": [],
+        "needs_review": [],
+        "error": ""
+    }
+
+    result = get_compiled_graph().invoke(initial_state)
+
+    if result["error"]:
         return {
-            "error": "Unsupported file type",
+            "error": result["error"],
             "subscriptions": [],
             "needs_review": [],
-            "parsed_rows": [],
-            "row_count": 0
+            "debug_text_preview": result.get("extracted_text", "")[:2000]
         }
 
-    subscriptions, needs_review, parsed_df = run_detection(df)
-
     return {
-        "subscriptions": subscriptions,
-        "needs_review": needs_review,
-        "parsed_rows": parsed_df.to_dict(orient="records"),
-        "row_count": len(parsed_df),
-        "error": ""
+        "subscriptions": result["subscriptions"],
+        "needs_review": result["needs_review"],
+        "parsed_rows": result["df"].to_dict(orient="records") if result["df"] is not None else [],
+        "row_count": len(result["df"]) if result["df"] is not None else 0
     }
 
 
@@ -391,7 +651,6 @@ async def enrich(payload: dict = Body(...)):
 
     api_key = os.getenv("OPENAI_API_KEY")
 
-    # fallback without LLM
     if not api_key:
         enriched = []
         for sub in subscriptions:
@@ -415,7 +674,7 @@ async def enrich(payload: dict = Body(...)):
 You are classifying a subscription merchant.
 Merchant: {merchant_name}
 
-Return strict JSON with exactly these keys:
+Return JSON with exactly these keys:
 category
 description
 
