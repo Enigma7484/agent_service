@@ -1,0 +1,50 @@
+Transaction Date,Description,Debit,Credit,Currency,Account,Type
+2026-01-01,Opening Balance,,,CAD,Chequing,balance
+2026-01-02,Hydro One,62.13,,CAD,Credit Card,bill
+2026-01-03,NETFLIX.COM,15.99,,CAD,Credit Card,subscription
+2026-01-05,UBER TRIP,18.22,,CAD,Credit Card,transport
+2026-01-08,ROGERS COMMUNICATIONS,74.5,,CAD,Credit Card,bill
+2026-01-10,SPOTIFY,11.99,,CAD,Credit Card,subscription
+2026-01-12,AMAZON PRIME,9.99,,CAD,Credit Card,subscription
+2026-01-15,GOODLIFE FITNESS,29.99,,CAD,Credit Card,subscription
+2026-01-18,Adobe Creative Cloud,22.59,,CAD,Credit Card,software
+2026-01-22,GROCERY WORLD,96.44,,CAD,Chequing,shopping
+2026-01-25,TRANSFER TO SAVINGS,300.0,,CAD,Chequing,transfer
+2026-01-26,GOOGLE STORAGE,2.79,,CAD,Credit Card,subscription
+2026-01-27,Payment Thank You,120.0,,CAD,Credit Card,payment
+2026-01-29,City Insurance,44.0,,CAD,Chequing,insurance
+2026-02-02,Hydro-One,61.98,,CAD,Credit Card,bill
+2026-02-03,Netflix,15.99,,CAD,Credit Card,subscription
+2026-02-08,ROGERS-CABLE,74.47,,CAD,Credit Card,bill
+2026-02-10,Spotify AB,11.99,,CAD,Credit Card,subscription
+2026-02-12,AMZN PRIME,9.99,,CAD,Credit Card,subscription
+2026-02-15,GOODLIFE,29.99,,CAD,Credit Card,subscription
+2026-02-18,Adobe Systems,22.59,,CAD,Credit Card,software
+2026-02-20,CAFE NORTH,8.45,,CAD,Chequing,food
+2026-02-21,Refund - CAFE NORTH,,8.45,CAD,Chequing,refund
+2026-02-25,TRANSFER TO SAVINGS,300.0,,CAD,Chequing,transfer
+2026-02-26,GOOGLE*STORAGE,2.79,,CAD,Credit Card,subscription
+2026-02-28,City Insurance,44.0,,CAD,Chequing,insurance
+2026-03-02,Hydro One Utilities,62.05,,CAD,Credit Card,bill
+2026-03-03,NETFLIX*1234,15.99,,CAD,Credit Card,subscription
+2026-03-08,ROGERS,74.52,,CAD,Credit Card,bill
+2026-03-10,SPOTIFY*PREMIUM,11.99,,CAD,Credit Card,subscription
+2026-03-12,AMAZONPRIME,9.99,,CAD,Credit Card,subscription
+2026-03-15,GOODLIFE FITNESS CLUB,29.99,,CAD,Credit Card,subscription
+2026-03-18,Adobe Creative Cloud,22.59,,CAD,Credit Card,software
+2026-03-20,UBER TRIP,9.75,,CAD,Credit Card,transport
+2026-03-22,Cash Advance,50.0,,CAD,Credit Card,cash_advance
+2026-03-26,GOOGLE STORAGE,2.79,,CAD,Credit Card,subscription
+2026-03-28,City Insurance,44.0,,CAD,Chequing,insurance
+2026-03-29,Opening Balance,,,CAD,Chequing,balance
+2026-04-02,Hydro One,63.11,,CAD,Credit Card,bill
+2026-04-03,NETFLIX.COM,15.99,,CAD,Credit Card,subscription
+2026-04-08,ROGERS COMMUNICATIONS,74.61,,CAD,Credit Card,bill
+2026-04-10,SPOTIFY,11.99,,CAD,Credit Card,subscription
+2026-04-12,Amazon Prime,9.99,,CAD,Credit Card,subscription
+2026-04-15,GOODLIFE FITNESS,29.99,,CAD,Credit Card,subscription
+2026-04-18,Adobe Creative Cloud,22.59,,CAD,Credit Card,software
+2026-04-23,Payroll Deposit,,2150.0,CAD,Chequing,income
+2026-04-26,GOOGLE STORAGE,2.79,,CAD,Credit Card,subscription
+2026-04-28,City Insurance,44.0,,CAD,Chequing,insurance
+2026-04-30,Closing Balance,,,CAD,Chequing,balance
