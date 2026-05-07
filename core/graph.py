@@ -17,10 +17,12 @@ def detect_file_type(state: AgentState) -> AgentState:
     filename = state["filename"].lower()
     if filename.endswith(".csv"):
         state["file_type"] = "csv"
+    elif filename.endswith(".xlsx") or filename.endswith(".xls"):
+        state["file_type"] = "excel"
     elif filename.endswith(".pdf"):
         state["file_type"] = "pdf"
     else:
-        state["error"] = "Unsupported file type. Please upload a CSV or PDF file."
+        state["error"] = "Unsupported file type. Please upload a CSV, Excel, or PDF file."
     return state
 
 
@@ -44,6 +46,29 @@ def parse_csv(state: AgentState) -> AgentState:
         state["warnings"].extend(warnings)
     except Exception as e:
         state["error"] = f"Failed to parse CSV: {str(e)}"
+    return state
+
+
+def parse_excel(state: AgentState) -> AgentState:
+    if state["error"]:
+        return state
+    try:
+        raw_df = pd.read_excel(io.BytesIO(state["raw_bytes"]))
+        df, detected_schema, warnings = map_dataframe_to_standard_schema(raw_df)
+
+        required = ["date", "merchant", "amount"]
+        missing = [col for col in required if col not in df.columns]
+        if missing:
+            state["error"] = f"Could not map required columns: {', '.join(missing)}"
+            state["detected_schema"] = detected_schema
+            state["warnings"].extend(warnings)
+            return state
+
+        state["df"] = df
+        state["detected_schema"] = detected_schema
+        state["warnings"].extend(warnings)
+    except Exception as e:
+        state["error"] = f"Failed to parse Excel file: {str(e)}"
     return state
 
 
@@ -127,12 +152,20 @@ def route_after_type(state: AgentState):
         return "finalize"
     if state["file_type"] == "csv":
         return "parse_csv"
+    if state["file_type"] == "excel":
+        return "parse_excel"
     if state["file_type"] == "pdf":
         return "extract_pdf"
     return "finalize"
 
 
 def route_after_csv(state: AgentState):
+    if state["error"]:
+        return "finalize"
+    return "standardize_schema"
+
+
+def route_after_excel(state: AgentState):
     if state["error"]:
         return "finalize"
     return "standardize_schema"
@@ -162,6 +195,7 @@ def get_compiled_graph():
 
     graph.add_node("detect_file_type", detect_file_type)
     graph.add_node("parse_csv", parse_csv)
+    graph.add_node("parse_excel", parse_excel)
     graph.add_node("extract_pdf", extract_pdf)
     graph.add_node("parse_pdf", parse_pdf)
     graph.add_node("standardize_schema", standardize_schema)
@@ -172,10 +206,15 @@ def get_compiled_graph():
 
     graph.add_conditional_edges("detect_file_type", route_after_type, {
         "parse_csv": "parse_csv",
+        "parse_excel": "parse_excel",
         "extract_pdf": "extract_pdf",
         "finalize": "finalize"
     })
     graph.add_conditional_edges("parse_csv", route_after_csv, {
+        "standardize_schema": "standardize_schema",
+        "finalize": "finalize"
+    })
+    graph.add_conditional_edges("parse_excel", route_after_excel, {
         "standardize_schema": "standardize_schema",
         "finalize": "finalize"
     })

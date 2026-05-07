@@ -53,6 +53,72 @@ async def analyze(file: UploadFile = File(...)):
     }
 
 
+@app.post("/analyze-rows")
+async def analyze_rows(payload: dict = Body(...)):
+    import pandas as pd
+    from core.detection import run_detection
+
+    rows = payload.get("rows", [])
+
+    if not rows:
+        return {
+            "subscriptions": [],
+            "needs_review": [],
+            "parsed_rows": [],
+            "row_count": 0,
+            "detected_schema": {},
+            "file_type": "manual",
+            "warnings": [],
+            "error": "No rows provided."
+        }
+
+    try:
+        df = pd.DataFrame(rows)
+
+        required = ["date", "merchant", "amount"]
+        missing = [col for col in required if col not in df.columns]
+
+        if missing:
+            return {
+                "subscriptions": [],
+                "needs_review": [],
+                "parsed_rows": rows,
+                "row_count": len(rows),
+                "detected_schema": {},
+                "file_type": "manual",
+                "warnings": [],
+                "error": f"Missing required fields: {', '.join(missing)}"
+            }
+
+        subscriptions, needs_review, parsed_df, warnings = run_detection(df)
+
+        return {
+            "subscriptions": subscriptions,
+            "needs_review": needs_review,
+            "parsed_rows": parsed_df.to_dict(orient="records"),
+            "row_count": len(parsed_df),
+            "detected_schema": {
+                "date": "manual",
+                "merchant": "manual",
+                "amount": "manual"
+            },
+            "file_type": "manual",
+            "warnings": warnings,
+            "error": ""
+        }
+    except Exception as e:
+        return {
+            "subscriptions": [],
+            "needs_review": [],
+            "parsed_rows": rows,
+            "row_count": len(rows),
+            "detected_schema": {},
+            "file_type": "manual",
+            "warnings": [],
+            "error": f"Failed to analyze rows: {str(e)}"
+        }
+
+
 @app.post("/recalculate")
 async def recalculate(payload: dict = Body(...)):
     return recalculate_from_rows(payload.get("parsed_rows", []))
