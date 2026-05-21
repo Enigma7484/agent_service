@@ -81,13 +81,14 @@ def gemini_models():
         for model in os.getenv("GEMINI_MODEL", "").split(",")
         if model.strip()
     ]
-    defaults = ["gemini-1.5-flash", "gemini-1.5-flash-latest", "gemini-2.0-flash"]
+    defaults = ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
     return list(dict.fromkeys(configured + defaults))
 
 
 def enrich_with_gemini(subscriptions, api_key):
     enriched = []
     warnings = []
+    used_model = None
 
     for sub in subscriptions:
         merchant_name = sub.get("merchant_normalized") or sub.get("merchant") or ""
@@ -120,11 +121,14 @@ description should be one short sentence.
         last_error = None
 
         for model in gemini_models():
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
             request = urllib.request.Request(
                 url,
                 data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": api_key,
+                },
                 method="POST",
             )
 
@@ -141,12 +145,16 @@ description should be one short sentence.
                 category = parsed.get("category", category)
                 description = parsed.get("description", description)
                 last_error = None
+                used_model = model
                 break
-            except (urllib.error.URLError, urllib.error.HTTPError, KeyError, IndexError, json.JSONDecodeError) as e:
-                last_error = e
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode("utf-8", errors="replace")
+                last_error = f"HTTP {e.code}: {detail[:240]}"
+            except (urllib.error.URLError, KeyError, IndexError, json.JSONDecodeError) as e:
+                last_error = str(e)
 
         if last_error:
-            warnings.append(f"Gemini fallback used for merchant: {merchant_name} ({str(last_error)})")
+            warnings.append(f"Gemini fallback used for merchant: {merchant_name} ({last_error})")
 
         item = dict(sub)
         item["category"] = category
@@ -154,7 +162,7 @@ description should be one short sentence.
         item["description"] = description
         enriched.append(item)
 
-    return enriched, warnings
+    return enriched, warnings, used_model
 
 
 def enrich_with_openai(subscriptions, api_key):
@@ -198,7 +206,7 @@ description should be one short sentence.
         item["description"] = description
         enriched.append(item)
 
-    return enriched, warnings
+    return enriched, warnings, os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
 
 def enrich_subscriptions(subscriptions):
@@ -209,19 +217,35 @@ def enrich_subscriptions(subscriptions):
     openai_api_key = openai_key()
 
     if not gemini_api_key and not openai_api_key:
-        return {"subscriptions": fallback_enrich(subscriptions), "warnings": [], "error": ""}
+        return {
+            "subscriptions": fallback_enrich(subscriptions),
+            "warnings": [],
+            "error": "",
+            "enrichment_provider": "rules_fallback",
+            "enrichment_model": "",
+        }
 
     try:
         if gemini_api_key:
-            enriched, warnings = enrich_with_gemini(subscriptions, gemini_api_key)
+            enriched, warnings, model = enrich_with_gemini(subscriptions, gemini_api_key)
+            provider = "gemini" if not warnings else "rules_fallback"
         else:
-            enriched, warnings = enrich_with_openai(subscriptions, openai_api_key)
+            enriched, warnings, model = enrich_with_openai(subscriptions, openai_api_key)
+            provider = "openai" if not warnings else "rules_fallback"
 
-        return {"subscriptions": enriched, "warnings": warnings, "error": ""}
+        return {
+            "subscriptions": enriched,
+            "warnings": warnings,
+            "error": "",
+            "enrichment_provider": provider,
+            "enrichment_model": model or "",
+        }
 
     except Exception as e:
         return {
             "subscriptions": fallback_enrich(subscriptions),
             "warnings": ["LLM enrichment failed; rule-based fallback used."],
             "error": "",
+            "enrichment_provider": "rules_fallback",
+            "enrichment_model": "",
         }
