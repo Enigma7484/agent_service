@@ -1,5 +1,7 @@
 import os
 import json
+import urllib.error
+import urllib.request
 
 
 def simple_category_rule(name: str) -> str:
@@ -28,33 +30,143 @@ def simple_bill_type(category: str) -> str:
     return "other_recurring"
 
 
-def enrich_subscriptions(subscriptions):
-    if not subscriptions:
-        return {"subscriptions": [], "warnings": [], "error": ""}
+def fallback_enrich(subscriptions):
+    enriched = []
+    for sub in subscriptions:
+        item = dict(sub)
+        category = simple_category_rule(sub.get("merchant_normalized", ""))
+        item["category"] = category
+        item["bill_type"] = simple_bill_type(category)
+        item["description"] = f"Likely recurring {category.lower()} charge."
+        enriched.append(item)
+    return enriched
 
-    api_key = os.getenv("OPENAI_API_KEY")
 
-    if not api_key:
-        enriched = []
-        for sub in subscriptions:
-            item = dict(sub)
-            category = simple_category_rule(sub.get("merchant_normalized", ""))
-            item["category"] = category
-            item["bill_type"] = simple_bill_type(category)
-            item["description"] = f"Likely recurring {category.lower()} charge."
-            enriched.append(item)
-        return {"subscriptions": enriched, "warnings": [], "error": ""}
+def parse_json_object(text: str):
+    text = (text or "").strip()
+    if not text:
+        return {}
 
     try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(text[start:end + 1])
+    return {}
 
-        enriched = []
-        warnings = []
 
-        for sub in subscriptions:
-            merchant_name = sub.get("merchant_normalized") or sub.get("merchant") or ""
-            prompt = f"""
+def gemini_key():
+    key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if key:
+        return key
+
+    # Some hosts have a single AI key variable configured. Gemini API keys
+    # commonly start with AIza, while OpenAI keys commonly start with sk-.
+    openai_key = os.getenv("OPENAI_API_KEY", "")
+    if openai_key and not openai_key.startswith("sk-"):
+        return openai_key
+    return ""
+
+
+def openai_key():
+    key = os.getenv("OPENAI_API_KEY", "")
+    return key if key.startswith("sk-") else ""
+
+
+def gemini_models():
+    configured = [
+        model.strip()
+        for model in os.getenv("GEMINI_MODEL", "").split(",")
+        if model.strip()
+    ]
+    defaults = ["gemini-1.5-flash", "gemini-1.5-flash-latest", "gemini-2.0-flash"]
+    return list(dict.fromkeys(configured + defaults))
+
+
+def enrich_with_gemini(subscriptions, api_key):
+    enriched = []
+    warnings = []
+
+    for sub in subscriptions:
+        merchant_name = sub.get("merchant_normalized") or sub.get("merchant") or ""
+        prompt = f"""
+Classify this recurring charge merchant.
+Merchant: {merchant_name}
+
+Return only strict JSON with exactly these keys:
+category
+description
+
+category should be short, like:
+Streaming, Utilities, Telecom, Cloud Storage, Transport, Other
+description should be one short sentence.
+"""
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": prompt}],
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.1,
+                "responseMimeType": "application/json",
+            },
+        }
+        category = simple_category_rule(merchant_name)
+        description = f"Likely recurring {category.lower()} charge."
+        last_error = None
+
+        for model in gemini_models():
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+            request = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+
+            try:
+                with urllib.request.urlopen(request, timeout=20) as response:
+                    response_body = json.loads(response.read().decode("utf-8"))
+                text = (
+                    response_body.get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text", "")
+                )
+                parsed = parse_json_object(text)
+                category = parsed.get("category", category)
+                description = parsed.get("description", description)
+                last_error = None
+                break
+            except (urllib.error.URLError, urllib.error.HTTPError, KeyError, IndexError, json.JSONDecodeError) as e:
+                last_error = e
+
+        if last_error:
+            warnings.append(f"Gemini fallback used for merchant: {merchant_name} ({str(last_error)})")
+
+        item = dict(sub)
+        item["category"] = category
+        item["bill_type"] = simple_bill_type(category)
+        item["description"] = description
+        enriched.append(item)
+
+    return enriched, warnings
+
+
+def enrich_with_openai(subscriptions, api_key):
+    from openai import OpenAI
+
+    client = OpenAI(api_key=api_key)
+    enriched = []
+    warnings = []
+
+    for sub in subscriptions:
+        merchant_name = sub.get("merchant_normalized") or sub.get("merchant") or ""
+        prompt = f"""
 You are classifying a recurring charge merchant.
 Merchant: {merchant_name}
 
@@ -67,39 +179,49 @@ Streaming, Utilities, Telecom, Cloud Storage, Transport, Other
 description should be one short sentence.
 """
 
-            response = client.responses.create(model="gpt-5-mini", input=prompt)
-            text = response.output_text.strip()
+        response = client.responses.create(model=os.getenv("OPENAI_MODEL", "gpt-5-mini"), input=prompt)
+        text = response.output_text.strip()
 
-            category = simple_category_rule(merchant_name)
-            description = f"Likely recurring {category.lower()} charge."
+        category = simple_category_rule(merchant_name)
+        description = f"Likely recurring {category.lower()} charge."
 
-            try:
-                parsed = json.loads(text)
-                category = parsed.get("category", category)
-                description = parsed.get("description", description)
-            except Exception:
-                warnings.append(f"Fallback parsing used for merchant: {merchant_name}")
+        try:
+            parsed = parse_json_object(text)
+            category = parsed.get("category", category)
+            description = parsed.get("description", description)
+        except Exception:
+            warnings.append(f"Fallback parsing used for merchant: {merchant_name}")
 
-            item = dict(sub)
-            item["category"] = category
-            item["bill_type"] = simple_bill_type(category)
-            item["description"] = description
-            enriched.append(item)
+        item = dict(sub)
+        item["category"] = category
+        item["bill_type"] = simple_bill_type(category)
+        item["description"] = description
+        enriched.append(item)
+
+    return enriched, warnings
+
+
+def enrich_subscriptions(subscriptions):
+    if not subscriptions:
+        return {"subscriptions": [], "warnings": [], "error": ""}
+
+    gemini_api_key = gemini_key()
+    openai_api_key = openai_key()
+
+    if not gemini_api_key and not openai_api_key:
+        return {"subscriptions": fallback_enrich(subscriptions), "warnings": [], "error": ""}
+
+    try:
+        if gemini_api_key:
+            enriched, warnings = enrich_with_gemini(subscriptions, gemini_api_key)
+        else:
+            enriched, warnings = enrich_with_openai(subscriptions, openai_api_key)
 
         return {"subscriptions": enriched, "warnings": warnings, "error": ""}
 
     except Exception as e:
-        enriched = []
-        for sub in subscriptions:
-            item = dict(sub)
-            category = simple_category_rule(sub.get("merchant_normalized", ""))
-            item["category"] = category
-            item["bill_type"] = simple_bill_type(category)
-            item["description"] = f"Likely recurring {category.lower()} charge."
-            enriched.append(item)
-
         return {
-            "subscriptions": enriched,
+            "subscriptions": fallback_enrich(subscriptions),
             "warnings": ["LLM enrichment failed; rule-based fallback used."],
-            "error": f"LLM enrichment failed, fallback rules used: {str(e)}",
+            "error": "",
         }

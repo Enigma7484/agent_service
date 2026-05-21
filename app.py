@@ -15,9 +15,11 @@ def health():
 @app.get("/ready")
 def ready():
     import os
+    openai_key = os.getenv("OPENAI_API_KEY", "")
     return {
         "ok": True,
-        "openai_configured": bool(os.getenv("OPENAI_API_KEY"))
+        "openai_configured": openai_key.startswith("sk-"),
+        "gemini_configured": bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or (openai_key and not openai_key.startswith("sk-")))
     }
 
 
