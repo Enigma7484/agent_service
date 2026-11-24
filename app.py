@@ -2,7 +2,7 @@ from fastapi import FastAPI, UploadFile, File, Body
 from core.models import build_initial_state
 from core.graph import get_compiled_graph
 from core.detection import recalculate_from_rows
-from core.enrichment import enrich_subscriptions
+from core.enrichment import enrich_subscriptions, gemini_key, openai_key
 
 app = FastAPI()
 
@@ -14,12 +14,10 @@ def health():
 
 @app.get("/ready")
 def ready():
-    import os
-    openai_key = os.getenv("OPENAI_API_KEY", "")
     return {
         "ok": True,
-        "openai_configured": openai_key.startswith("sk-"),
-        "gemini_configured": bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or (openai_key and not openai_key.startswith("sk-")))
+        "openai_configured": bool(openai_key()),
+        "gemini_configured": bool(gemini_key()),
     }
 
 
@@ -127,5 +125,5 @@ async def recalculate(payload: dict = Body(...)):
 
 
 @app.post("/enrich")
-async def enrich(payload: dict = Body(...)):
+def enrich(payload: dict = Body(...)):
     return enrich_subscriptions(payload.get("subscriptions", []))

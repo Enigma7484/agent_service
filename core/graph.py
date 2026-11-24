@@ -96,9 +96,17 @@ def parse_pdf(state: AgentState) -> AgentState:
 
         if not df_tables.empty and len(df_tables) >= len(df_text):
             df = df_tables
+            detected_schema = {
+                "date": "Date cell in PDF table",
+                "merchant": "Remaining non-empty cells in PDF table",
+                "amount": "Amount cell in PDF table",
+            }
             state["warnings"].append("Parsed PDF using table extraction.")
         elif not df_text.empty:
             df = df_text
+            detected_schema = {field: f"{field.title()} in PDF transaction text" for field in df.columns}
+            if "currency" in df.columns:
+                df = df.fillna({"currency": ""})
             state["warnings"].append("Parsed PDF using text extraction.")
         else:
             state["error"] = (
@@ -108,6 +116,7 @@ def parse_pdf(state: AgentState) -> AgentState:
             return state
 
         state["df"] = df.drop_duplicates().reset_index(drop=True)
+        state["detected_schema"] = detected_schema
     except Exception as e:
         state["error"] = f"Failed to parse PDF transactions: {str(e)}"
     return state
